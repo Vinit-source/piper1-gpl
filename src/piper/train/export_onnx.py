@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import pathlib
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +12,10 @@ from .vits.lightning import VitsModel
 
 _LOGGER = logging.getLogger(__name__)
 OPSET_VERSION = 15
+
+# Allow PosixPath in torch.load for PyTorch 2.6+ compatibility
+# This is needed because checkpoints may contain pathlib.PosixPath objects
+torch.serialization.add_safe_globals([pathlib.PosixPath, pathlib.WindowsPath])
 
 
 def main() -> None:
