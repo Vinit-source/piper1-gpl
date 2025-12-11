@@ -50,4 +50,10 @@ class EspeakPhonemizer:
         if sentence_phonemes:
             all_phonemes.append(sentence_phonemes)
 
-        return all_phonemes
+        clause_phoneme_text_tuples = []
+        print("Clause Phonemes: ", clause_phonemes)
+        print("Text: ", text)
+        for a, b in zip(clause_phonemes, re.split(r'[,.?]+', text)):
+          clause_phoneme_text_tuples.append("Phoneme: " + str(a) + " Text: " + b)
+          
+        return (all_phonemes, clause_phoneme_text_tuples)
