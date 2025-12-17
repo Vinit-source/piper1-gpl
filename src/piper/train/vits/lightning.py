@@ -78,12 +78,12 @@ class VitsModel(L.LightningModule):
         c_kl: float = 1.0,
         grad_clip: Optional[float] = 1.0,
         # Fine-tuning mode: layer-wise learning rates
-        finetune_mode: bool = True,
+        finetune_mode: bool = False,
         encoder_lr_scale: float = 0.1,  # Text encoder: 10% of base LR (protect)
         flow_lr_scale: float = 0.5,     # Flow/alignment: 50% of base LR (moderate)
         decoder_lr_scale: float = 1.0,  # Decoder: full LR (adapt fast)
         # Dynamic learning rate scheduler
-        lr_scheduler_type: str = "plateau",  # "exponential", "plateau", "cosine_warmup_restart"
+        lr_scheduler_type: str = "exponential",  # "exponential", "plateau", "cosine_warmup_restart"
         lr_patience: int = 5,           # Epochs to wait before reducing (plateau)
         lr_factor: float = 0.5,         # Factor to reduce LR by (plateau)
         lr_min: float = 1e-7,           # Minimum learning rate floor
@@ -156,6 +156,36 @@ class VitsModel(L.LightningModule):
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
         )
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Handle backward compatibility for optimizer states."""
+        if "optimizer_states" not in checkpoint or not checkpoint["optimizer_states"]:
+            return
+
+        # Check generator optimizer (index 0)
+        opt_g_state = checkpoint["optimizer_states"][0]
+        if not opt_g_state:
+            return
+
+        # Determine expected number of parameter groups
+        # If finetune_mode is True, we have 3 groups (encoder, flow, decoder)
+        # If finetune_mode is False, we have 1 group
+        expected_g_groups = 3 if self.hparams.finetune_mode else 1
+        
+        # Check actual groups in checkpoint
+        ckpt_g_groups = len(opt_g_state["param_groups"])
+        
+        if ckpt_g_groups != expected_g_groups:
+            _LOGGER.warning(
+                "Optimizer parameter groups mismatch: checkpoint has %d, model expects %d. "
+                "Discarding optimizer states from checkpoint to avoid loading error. "
+                "This is expected if you are switching between finetune_mode=True/False "
+                "or loading an old checkpoint with new settings.",
+                ckpt_g_groups,
+                expected_g_groups,
+            )
+            # clear optimizer states to force fresh initialization
+            checkpoint["optimizer_states"] = []
 
     def forward(self, text, text_lengths, scales, sid=None):
         noise_scale = scales[0]
