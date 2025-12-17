@@ -4,12 +4,18 @@ import ast
 import logging
 import operator
 from functools import reduce
+from itertools import chain
 from typing import Optional
 
 import lightning as L
 import torch
 from torch import autocast
 from torch.nn import functional as F
+from torch.optim.lr_scheduler import (
+    CosineAnnealingWarmRestarts,
+    ExponentialLR,
+    ReduceLROnPlateau,
+)
 
 from .commons import slice_segments
 from .dataset import Batch
@@ -70,7 +76,20 @@ class VitsModel(L.LightningModule):
         warmup_epochs: int = 0,
         c_mel: int = 45,
         c_kl: float = 1.0,
-        grad_clip: Optional[float] = None,
+        grad_clip: Optional[float] = 1.0,
+        # Fine-tuning mode: layer-wise learning rates
+        finetune_mode: bool = True,
+        encoder_lr_scale: float = 0.1,  # Text encoder: 10% of base LR (protect)
+        flow_lr_scale: float = 0.5,     # Flow/alignment: 50% of base LR (moderate)
+        decoder_lr_scale: float = 1.0,  # Decoder: full LR (adapt fast)
+        # Dynamic learning rate scheduler
+        lr_scheduler_type: str = "plateau",  # "exponential", "plateau", "cosine_warmup_restart"
+        lr_patience: int = 5,           # Epochs to wait before reducing (plateau)
+        lr_factor: float = 0.5,         # Factor to reduce LR by (plateau)
+        lr_min: float = 1e-7,           # Minimum learning rate floor
+        lr_cooldown: int = 2,           # Cooldown epochs after reduction (plateau)
+        cosine_t0: int = 10,            # Restart period for cosine annealing
+        cosine_t_mult: int = 2,         # Multiplier for restart period
         # unused
         dataset: object = None,
         **kwargs,
@@ -285,28 +304,144 @@ class VitsModel(L.LightningModule):
 
         return super().on_validation_end()
 
-    def configure_optimizers(self):
-        optimizers = [
-            torch.optim.AdamW(
-                self.model_g.parameters(),
-                lr=self.hparams.learning_rate,
-                betas=self.hparams.betas,
-                eps=self.hparams.eps,
-            ),
-            torch.optim.AdamW(
-                self.model_d.parameters(),
-                lr=self.hparams.learning_rate_d,
-                betas=self.hparams.betas_d,
-                eps=self.hparams.eps,
-            ),
+    def _get_generator_param_groups(self):
+        """Get parameter groups with layer-wise learning rates for fine-tuning.
+        
+        Separates the generator into three groups:
+        - encoder: Text encoder (enc_p) and embeddings - protected with low LR
+        - flow: Flow and duration predictor - moderate LR for prosody adaptation  
+        - decoder: HiFi-GAN decoder (dec) and posterior encoder (enc_q) - high LR for voice adaptation
+        """
+        base_lr = self.hparams.learning_rate
+        
+        # Encoder components (protect phoneme knowledge)
+        encoder_params = list(chain(
+            self.model_g.enc_p.parameters(),
+            self.model_g.emb.parameters() if hasattr(self.model_g, 'emb') else [],
+        ))
+        
+        # Flow components (moderate adaptation for prosody)
+        flow_params = list(chain(
+            self.model_g.flow.parameters(),
+            self.model_g.dp.parameters(),  # duration predictor
+        ))
+        
+        # Decoder components (fast adaptation for voice characteristics)
+        decoder_params = list(chain(
+            self.model_g.dec.parameters(),
+            self.model_g.enc_q.parameters(),  # posterior encoder
+        ))
+        
+        # Add speaker embedding if multi-speaker
+        if hasattr(self.model_g, 'emb_g') and self.model_g.emb_g is not None:
+            decoder_params.extend(self.model_g.emb_g.parameters())
+        
+        param_groups = [
+            {
+                "params": encoder_params,
+                "lr": base_lr * self.hparams.encoder_lr_scale,
+                "name": "encoder",
+            },
+            {
+                "params": flow_params,
+                "lr": base_lr * self.hparams.flow_lr_scale,
+                "name": "flow",
+            },
+            {
+                "params": decoder_params,
+                "lr": base_lr * self.hparams.decoder_lr_scale,
+                "name": "decoder",
+            },
         ]
-        schedulers = [
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizers[0], gamma=self.hparams.lr_decay
-            ),
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizers[1], gamma=self.hparams.lr_decay_d
-            ),
-        ]
+        
+        _LOGGER.info(
+            "Fine-tuning mode: encoder_lr=%.2e, flow_lr=%.2e, decoder_lr=%.2e",
+            base_lr * self.hparams.encoder_lr_scale,
+            base_lr * self.hparams.flow_lr_scale,
+            base_lr * self.hparams.decoder_lr_scale,
+        )
+        
+        return param_groups
 
+    def _create_scheduler(self, optimizer, is_discriminator=False):
+        """Create learning rate scheduler based on scheduler type."""
+        scheduler_type = self.hparams.lr_scheduler_type
+        
+        if scheduler_type == "exponential":
+            # Original behavior - continuous exponential decay
+            gamma = self.hparams.lr_decay_d if is_discriminator else self.hparams.lr_decay
+            scheduler = ExponentialLR(optimizer, gamma=gamma)
+            return {"scheduler": scheduler, "interval": "epoch"}
+        
+        elif scheduler_type == "plateau":
+            # Reduce LR when validation loss plateaus - good for escaping local maxima
+            scheduler = ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=self.hparams.lr_factor,
+                patience=self.hparams.lr_patience,
+                min_lr=self.hparams.lr_min,
+                cooldown=self.hparams.lr_cooldown,
+                verbose=True,
+            )
+            return {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+                "strict": True,
+            }
+        
+        elif scheduler_type == "cosine_warmup_restart":
+            # Cosine annealing with warm restarts - periodic LR increases to escape local maxima
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=self.hparams.cosine_t0,
+                T_mult=self.hparams.cosine_t_mult,
+                eta_min=self.hparams.lr_min,
+            )
+            return {"scheduler": scheduler, "interval": "epoch"}
+        
+        else:
+            raise ValueError(
+                f"Unknown lr_scheduler_type: {scheduler_type}. "
+                "Choose from: 'exponential', 'plateau', 'cosine_warmup_restart'"
+            )
+
+    def configure_optimizers(self):
+        # Generator optimizer with optional layer-wise learning rates
+        if self.hparams.finetune_mode:
+            param_groups_g = self._get_generator_param_groups()
+        else:
+            param_groups_g = [
+                {"params": self.model_g.parameters(), "lr": self.hparams.learning_rate}
+            ]
+        
+        opt_g = torch.optim.AdamW(
+            param_groups_g,
+            betas=self.hparams.betas,
+            eps=self.hparams.eps,
+        )
+        
+        # Discriminator optimizer (full learning rate)
+        opt_d = torch.optim.AdamW(
+            self.model_d.parameters(),
+            lr=self.hparams.learning_rate_d,
+            betas=self.hparams.betas_d,
+            eps=self.hparams.eps,
+        )
+        
+        optimizers = [opt_g, opt_d]
+        
+        # Create schedulers based on scheduler type
+        scheduler_g = self._create_scheduler(opt_g, is_discriminator=False)
+        scheduler_d = self._create_scheduler(opt_d, is_discriminator=True)
+        schedulers = [scheduler_g, scheduler_d]
+        
+        _LOGGER.info(
+            "Using %s learning rate scheduler (finetune_mode=%s)",
+            self.hparams.lr_scheduler_type,
+            self.hparams.finetune_mode,
+        )
+        
         return optimizers, schedulers
