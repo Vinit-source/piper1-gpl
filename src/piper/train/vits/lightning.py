@@ -300,6 +300,21 @@ class VitsModel(L.LightningModule):
         return val_loss
 
     def on_validation_end(self) -> None:
+        # Manual scheduler stepping for manual optimization
+        if not self.trainer.sanity_checking:
+            val_loss = self.trainer.callback_metrics.get("val_loss")
+            schedulers = self.lr_schedulers()
+            if schedulers is not None:
+                if not isinstance(schedulers, list):
+                    schedulers = [schedulers]
+                
+                for scheduler in schedulers:
+                    if isinstance(scheduler, ReduceLROnPlateau):
+                        if val_loss is not None:
+                            scheduler.step(val_loss)
+                    else:
+                        scheduler.step()
+
         # Generate audio examples after validation, but not during sanity check
         if self.trainer.sanity_checking:
             return super().on_validation_end()
@@ -401,7 +416,7 @@ class VitsModel(L.LightningModule):
             # Original behavior - continuous exponential decay
             gamma = self.hparams.lr_decay_d if is_discriminator else self.hparams.lr_decay
             scheduler = ExponentialLR(optimizer, gamma=gamma)
-            return {"scheduler": scheduler, "interval": "epoch"}
+            return scheduler
         
         elif scheduler_type == "plateau":
             # Reduce LR when validation loss plateaus - good for escaping local maxima
@@ -414,13 +429,7 @@ class VitsModel(L.LightningModule):
                 cooldown=self.hparams.lr_cooldown,
                 verbose=True,
             )
-            return {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1,
-                "strict": True,
-            }
+            return scheduler
         
         elif scheduler_type == "cosine_warmup_restart":
             # Cosine annealing with warm restarts - periodic LR increases to escape local maxima
@@ -430,7 +439,7 @@ class VitsModel(L.LightningModule):
                 T_mult=self.hparams.cosine_t_mult,
                 eta_min=self.hparams.lr_min,
             )
-            return {"scheduler": scheduler, "interval": "epoch"}
+            return scheduler
         
         else:
             raise ValueError(
