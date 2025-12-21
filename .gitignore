@@ -22,3 +22,5 @@ src/piper/train/vits/monotonic_align/core.c
 lightning_logs/
 
 content/dataset_8hr/
+content/dataset_24hr/
+content/IISc_SPICOR_Data/
