@@ -61,6 +61,7 @@ class VitsDataModule(L.LightningDataModule):
         trim_silence: bool = True,
         keep_seconds_before_silence: float = 0.25,
         keep_seconds_after_silence: float = 0.25,
+        split_method: str = "random",
     ) -> None:
         super().__init__()
 
@@ -100,6 +101,7 @@ class VitsDataModule(L.LightningDataModule):
         self.trim_silence = trim_silence
         self.keep_seconds_before_silence = keep_seconds_before_silence
         self.keep_seconds_after_silence = keep_seconds_after_silence
+        self.split_method = split_method
 
         self.piper_config: Optional[PiperConfig] = None
         self.is_multispeaker = self.num_speakers > 1
@@ -347,9 +349,27 @@ class VitsDataModule(L.LightningDataModule):
 
         valid_set_size = int(len(full_dataset) * self.validation_split)
         train_set_size = len(full_dataset) - valid_set_size - self.num_test_examples
-        self.train_dataset, self.test_dataset, self.val_dataset = random_split(
-            full_dataset, [train_set_size, self.num_test_examples, valid_set_size]
-        )
+
+        if self.split_method == "sequential":
+            # Sequential split respecting metadata order
+            # Order: Train -> Test -> Val
+            # Or Train -> Val -> Test?
+            # Standard random_split doesn't imply order, but usually we want Train first.
+            indices = list(range(len(full_dataset)))
+            train_indices = indices[:train_set_size]
+            test_indices = indices[train_set_size : train_set_size + self.num_test_examples]
+            val_indices = indices[train_set_size + self.num_test_examples :]
+            
+            from torch.utils.data import Subset
+            self.train_dataset = Subset(full_dataset, train_indices)
+            self.test_dataset = Subset(full_dataset, test_indices)
+            self.val_dataset = Subset(full_dataset, val_indices)
+            _LOGGER.info("Using SEQUENTIAL split for dataset.")
+        else:
+            self.train_dataset, self.test_dataset, self.val_dataset = random_split(
+                full_dataset, [train_set_size, self.num_test_examples, valid_set_size]
+            )
+            _LOGGER.info("Using RANDOM split for dataset.")
 
     def train_dataloader(self):
         return DataLoader(

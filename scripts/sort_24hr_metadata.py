@@ -73,8 +73,8 @@ def main():
         count = get_non_english_count(transcript)
         processed_entries.append((count, line, filename))
         
-    # Sort: Primary = count (descending), Secondary = filename (ascending)
-    processed_entries.sort(key=lambda x: (-x[0], x[2]))
+    # Sort: Primary = count (ascending), Secondary = filename (ascending)
+    processed_entries.sort(key=lambda x: (x[0], x[2]))
     
     print("Sorting complete. Writing back to file...")
     
@@ -87,8 +87,8 @@ def main():
     print("SORTING STATISTICS")
     print("="*40)
     if processed_entries:
-        highest = processed_entries[0][0]
-        lowest = processed_entries[-1][0]
+        highest = processed_entries[-1][0]
+        lowest = processed_entries[0][0]
         print(f"Highest Non-English Count: {highest}")
         print(f"Lowest Non-English Count:  {lowest}")
         
